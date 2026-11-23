@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from sqlalchemy import CheckConstraint, Column, Index, Integer, MetaData, String, Table, event
+from sqlalchemy import CheckConstraint, Column, Index, Integer, MetaData, String, Table, Text, event
 from sqlalchemy.engine import URL, Engine, create_engine
 
 metadata = MetaData()
@@ -24,6 +24,13 @@ Index(
     candle_batches.c.timeframe,
     candle_batches.c.first_open,
     candle_batches.c.last_open,
+)
+
+backtest_runs = Table(
+    "backtest_runs",
+    metadata,
+    Column("id", String(64), primary_key=True),
+    Column("report_json", Text, nullable=False),
 )
 
 

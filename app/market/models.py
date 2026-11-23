@@ -17,6 +17,7 @@ type Volume = Annotated[
 
 
 class Timeframe(StrEnum):
+    THREE_MINUTES = "3m"
     FIVE_MINUTES = "5m"
     FIFTEEN_MINUTES = "15m"
     ONE_HOUR = "1h"
@@ -28,6 +29,7 @@ class Timeframe(StrEnum):
 
 
 DURATIONS = {
+    Timeframe.THREE_MINUTES: timedelta(minutes=3),
     Timeframe.FIVE_MINUTES: timedelta(minutes=5),
     Timeframe.FIFTEEN_MINUTES: timedelta(minutes=15),
     Timeframe.ONE_HOUR: timedelta(hours=1),

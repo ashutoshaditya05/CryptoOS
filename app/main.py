@@ -6,6 +6,8 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import AwareDatetime
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.backtest.models import BacktestReport, BacktestRequest
+from app.backtest.service import get_backtest, run_backtest
 from app.config import data_directory
 from app.market.models import BITCOIN, Candle, Market, Timeframe, candle_window
 from app.market.storage import CandleStore, StorageError
@@ -81,6 +83,25 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             raise HTTPException(422, str(exc)) from exc
         except (SQLAlchemyError, StorageError) as exc:
             raise HTTPException(503, "Candle storage unavailable.") from exc
+
+    @app.post("/backtests")
+    def create_backtest(request: BacktestRequest) -> BacktestReport:
+        try:
+            return run_backtest(store, request)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        except (SQLAlchemyError, StorageError) as exc:
+            raise HTTPException(503, "Backtest storage unavailable.") from exc
+
+    @app.get("/backtests/{run_id}")
+    def read_backtest(run_id: str) -> BacktestReport:
+        try:
+            report = get_backtest(store, run_id)
+        except SQLAlchemyError as exc:
+            raise HTTPException(503, "Backtest storage unavailable.") from exc
+        if report is None:
+            raise HTTPException(404, "Backtest not found.")
+        return report
 
     return app
 
