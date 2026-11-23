@@ -29,7 +29,7 @@ The simulator accounts for fees, spread, slippage, liquidity limits, and partial
 
 ## Quantitative analysis
 
-Let $E_t$ be portfolio equity at time $t$, $E_0$ the starting equity, and $E_T$ the final equity.
+Let $E_t$ be portfolio equity at time $t$, with starting equity $E_0$ and final equity $E_T$. For daily risk metrics, $r_d$ is the return between consecutive UTC midnight marks, $\bar{r}$ is its sample mean, and $s_r$ is its sample standard deviation.
 
 | Metric | Calculation |
 | --- | --- |
@@ -37,7 +37,9 @@ Let $E_t$ be portfolio equity at time $t$, $E_0$ the starting equity, and $E_T$ 
 | Maximum drawdown | Largest fractional decline from a running equity peak, $\max_t (1 - E_t / \max_{s \le t} E_s)$ |
 | Net expectancy | Mean net profit or loss per completed trade, including modeled trading costs |
 | Profit factor | Sum of winning trades' net profits divided by the absolute sum of losing trades' net losses |
-| Volatility, Sharpe, and Sortino | Annualized from consecutive UTC daily equity returns. Sharpe uses return volatility, and Sortino uses downside deviation relative to zero. |
+| Annualized volatility | $\sqrt{365}\,s_r$ |
+| Sharpe ratio | $\sqrt{365}\,\bar{r}/s_r$, using a zero risk-free rate |
+| Sortino ratio | $\sqrt{365}\,\bar{r}/\sqrt{\operatorname{mean}(\min(r_d,0)^2)}$, using a zero target return |
 | Historical 95% value at risk | Estimated daily loss at the 5th percentile of observed returns, floored at zero |
 
 ## Research and reproducibility
