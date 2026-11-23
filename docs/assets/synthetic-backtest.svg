@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="800" height="350" viewBox="0 0 800 350" role="img" aria-labelledby="title description">
   <title id="title">Synthetic backtest equity</title>
-  <desc id="description">From an initial 100 INR, the strategy ends at 99 INR and the buy-and-hold benchmark ends at 99.90 INR. Points after the initial balance are measured at three-minute candle closes.</desc>
+  <desc id="description">From an initial 100 INR, the strategy ends at 99 INR and the buy-and-hold benchmark ends at 99.90 INR. Points after the initial balance are measured at candle closes.</desc>
   <rect x="1" y="1" width="798" height="348" rx="15" fill="#0b1c29" stroke="#243b4a"/>
 
   <g font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
@@ -28,11 +28,11 @@
         <text x="103" y="271">99.00</text>
       </g>
       <g text-anchor="middle">
-        <text x="120" y="309">00:24</text>
-        <text x="306" y="309">00:27</text>
-        <text x="492" y="309">00:30</text>
-        <text x="678" y="309">00:33</text>
-        <text x="399" y="332">Time (UTC)</text>
+        <text x="120" y="309">Start</text>
+        <text x="306" y="309">1</text>
+        <text x="492" y="309">2</text>
+        <text x="678" y="309">3</text>
+        <text x="399" y="332">Replay step</text>
       </g>
     </g>
 

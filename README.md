@@ -4,39 +4,56 @@
 
 **A personal quantitative research project for Bitcoin spot.**
 
-TradeOS replays historical BTC/INR candles from Delta Exchange India to evaluate intraday strategies and simulate long-only spot trades in INR.
+TradeOS uses historical BTC/INR data from Delta Exchange India to study market behavior, simulate execution in INR, and measure the risk and performance of trading models.
 
 ## Workflow
 
 ```mermaid
 flowchart LR
     A["Closed BTC/INR candles"] --> B["Validated candle store"]
-    B --> C["Versioned strategy replay"]
-    C --> D["Backtest and research report"]
+    B --> C["Historical replay"]
+    C --> D["Simulation and research report"]
 ```
 
 TradeOS preserves missing intervals as gaps and derives larger candles only from complete sets of smaller ones. Parquet holds the candle batches, and SQLite indexes them and stores backtest reports.
 
-The Python strategy engine evaluates closed candles and records each BUY, SELL, or HOLD decision with its strategy version and reason codes. FastAPI exposes market data, signals, and saved reports.
-
-## Strategies
-
-| Strategy | Candle interval | What it evaluates |
-| --- | --- | --- |
-| VWAP / EMA9 crossover | 3 minutes | Looks for a lower-wick touch of session VWAP and a close that crosses above EMA9. Resets VWAP at midnight UTC. |
-| EMA pullback | 15 minutes with 1-hour context | Looks for an EMA20 reclaim in an uptrend, with trend-strength and volatility filters. Uses ATR to set a stop and a target. |
+The Python replay engine uses closed candles and records decisions with version and reason codes. FastAPI exposes market data, signals, and saved reports.
 
 ## Backtest example
 
-Orders from strategy signals can fill at the next scheduled candle open. The simulator accounts for fees, spread, slippage, liquidity limits, and partial fills. Each report includes orders and fills, closed trades, candle-close equity, drawdown, and a buy-and-hold comparison.
+The simulator accounts for fees, spread, slippage, liquidity limits, and partial fills. Each report includes an order and fill ledger, closed trades, a candle-close equity curve, and a buy-and-hold benchmark.
 
 ![Synthetic backtest equity starts at INR 100 for both runs and ends at INR 99.00 for the strategy and INR 99.90 for buy and hold.](docs/assets/synthetic-backtest.svg)
 
-*This three-candle example comes from the synthetic test suite. The strategy buys 0.10 BTC in a partial fill, then closes the position. It starts with ₹100.00 and finishes at ₹99.00, including ₹0.20 in fees. The buy-and-hold benchmark finishes at ₹99.90.*
+*Both runs use synthetic data and start with ₹100.00. Simulated equity ends at ₹99.00, and the buy-and-hold benchmark ends at ₹99.90.*
+
+## Quantitative analysis
+
+Let $E_t$ be portfolio equity at time $t$, $E_0$ the starting equity, and $E_T$ the final equity.
+
+| Metric | Calculation |
+| --- | --- |
+| Total return | $E_T / E_0 - 1$ |
+| Maximum drawdown | Largest fractional decline from a running equity peak, $\max_t (1 - E_t / \max_{s \le t} E_s)$ |
+| Net expectancy | Mean net profit or loss per completed trade, including modeled trading costs |
+| Profit factor | Sum of winning trades' net profits divided by the absolute sum of losing trades' net losses |
+| Volatility, Sharpe, and Sortino | Annualized from consecutive UTC daily equity returns. Sharpe uses return volatility, and Sortino uses downside deviation relative to zero. |
+| Historical 95% value at risk | Estimated daily loss at the 5th percentile of observed returns, floored at zero |
 
 ## Research and reproducibility
 
-- **Chronological evaluation** runs training, validation, and holdout windows independently. When EMA pullback candidates are supplied, walk-forward evaluation selects settings using earlier data.
-- **Cost sensitivity** compares the same strategy under zero, base, and higher trading costs.
-- **Trade-block bootstrap** uses a fixed seed to estimate return and drawdown ranges when the sample has enough closed trades.
-- **Run identity** ties saved reports to the input candle hash, code hash, and strategy settings fingerprint. Reports also record coverage gaps.
+- **Time-ordered validation** runs independent training, validation, and holdout windows. Walk-forward experiments use earlier data to select settings and later data to evaluate them.
+- **Cost sensitivity** measures how results change across zero, base, and higher trading costs.
+- **Monte Carlo analysis** resamples blocks of consecutive closed trades with a fixed seed to estimate return and drawdown quantiles when the sample is large enough.
+- **Reproducibility** ties each saved report to input candle and code hashes, a settings fingerprint, and a record of coverage gaps.
+
+## Machine learning roadmap
+
+Planned experiments build on statistical baselines and test whether adding model complexity improves out-of-sample results.
+
+| Research area | Planned experiments |
+| --- | --- |
+| Supervised learning | Compare regularized regression with gradient-boosted trees using features available at prediction time. |
+| Market regimes | Explore hidden Markov models for changing market states and Bayesian methods for updating estimates as observations arrive. |
+| Volatility forecasting | Compare simple rolling volatility estimates with GARCH models for time-varying volatility. |
+| Model validation | Check for time-series leakage, assess forecast accuracy and probability calibration where applicable, and compare simulated results after costs on a held-out period. |
