@@ -1,4 +1,5 @@
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -60,6 +61,17 @@ class CandleStore:
     ) -> list[Candle]:
         with self.engine.connect() as connection:
             return self._read_window(connection, market, timeframe, start, end)
+
+    def read_windows(
+        self, market: Market, windows: Sequence[tuple[Timeframe, datetime, datetime]]
+    ) -> list[list[Candle]]:
+        with self.engine.begin() as connection:
+            # SQLite's legacy driver does not start a read transaction for SELECT alone.
+            connection.exec_driver_sql("BEGIN")
+            return [
+                self._read_window(connection, market, timeframe, start, end)
+                for timeframe, start, end in windows
+            ]
 
     def write_page(
         self,

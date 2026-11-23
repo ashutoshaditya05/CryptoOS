@@ -1,3 +1,4 @@
+import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -6,9 +7,6 @@ from pathlib import Path
 
 import httpx
 import pytest
-from alembic import command
-from alembic.config import Config
-from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from app.backfill import main
@@ -23,21 +21,18 @@ FIVE = Timeframe.FIVE_MINUTES
 STEP = FIVE.duration
 
 
-@pytest.fixture
-def migrated_dir(tmp_path: Path) -> Path:
-    config = Config(Path(__file__).resolve().parents[1] / "alembic.ini")
-    config.attributes["data_dir"] = tmp_path
-    command.upgrade(config, "head")
-    return tmp_path
+def api_get(data_dir: Path, *requests: tuple[str, dict[str, str] | None]) -> list[httpx.Response]:
+    async def send() -> list[httpx.Response]:
+        app = create_app(data_dir)
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as api,
+        ):
+            return [await api.get(path, params=params) for path, params in requests]
 
-
-@pytest.fixture
-def store(migrated_dir: Path):
-    storage = CandleStore(migrated_dir)
-    try:
-        yield storage
-    finally:
-        storage.close()
+    return asyncio.run(send())
 
 
 def bar(index: int, *, close: str = "101", volume: str | None = "2") -> Candle:
@@ -122,24 +117,27 @@ def test_delta_backfill_to_api_is_idempotent(store: CandleStore, migrated_dir: P
     assert reports[0].gaps[0].end == START + 3 * STEP
     assert len(list(migrated_dir.glob("candles/5m/*.parquet"))) == 2
 
-    local_offset = "+05:30"
-    with TestClient(create_app(migrated_dir)) as api:
-        assert api.get("/health").json() == {"status": "ok"}
-        assert api.get("/markets").json() == [BITCOIN.model_dump(mode="json")]
-        response = api.get(
+    health, markets, response = api_get(
+        migrated_dir,
+        ("/health", None),
+        ("/markets", None),
+        (
             "/candles",
-            params={"start": f"2026-11-20T05:30:00{local_offset}", "end": "2026-11-20T00:20:00Z"},
-        )
-        assert response.status_code == 200
-        candles = response.json()
-        assert [candle["open_time"] for candle in candles] == [
-            "2026-11-20T00:00:00Z",
-            "2026-11-20T00:15:00Z",
-        ]
-        assert Decimal(candles[0]["open"]) == Decimal("100.123456789012345678")
-        assert Decimal(candles[0]["volume"]) == Decimal("0.00004599999999999999")
-        assert candles[1]["volume"] is None
-        assert all(candle["is_closed"] for candle in candles)
+            {"start": "2026-11-20T05:30:00+05:30", "end": "2026-11-20T00:20:00Z"},
+        ),
+    )
+    assert health.json() == {"status": "ok"}
+    assert markets.json() == [BITCOIN.model_dump(mode="json")]
+    assert response.status_code == 200
+    candles = response.json()
+    assert [candle["open_time"] for candle in candles] == [
+        "2026-11-20T00:00:00Z",
+        "2026-11-20T00:15:00Z",
+    ]
+    assert Decimal(candles[0]["open"]) == Decimal("100.123456789012345678")
+    assert Decimal(candles[0]["volume"]) == Decimal("0.00004599999999999999")
+    assert candles[1]["volume"] is None
+    assert all(candle["is_closed"] for candle in candles)
 
 
 def test_new_data_can_fill_a_previous_gap(store: CandleStore):
@@ -251,40 +249,21 @@ def test_delta_retries_public_reads_and_rejects_futures(monkeypatch: pytest.Monk
     assert calls == ["/v2/products/BTC_INR"] * 2
 
 
-def test_candles_api_validates_window(migrated_dir: Path):
-    with TestClient(create_app(migrated_dir)) as api:
-        assert (
-            api.get(
-                "/candles",
-                params={
-                    "start": "2026-11-20T00:00:00",
-                    "end": "2026-11-20T00:15:00Z",
-                },
-            ).status_code
-            == 422
-        )
-        assert (
-            api.get(
-                "/candles",
-                params={
-                    "start": "2026-11-20T00:01:00Z",
-                    "end": "2026-11-20T00:15:00Z",
-                },
-            ).status_code
-            == 422
-        )
-        assert (
-            api.get(
-                "/candles",
-                params={
-                    "start": "2026-11-01T00:00:00Z",
-                    "end": "2026-11-20T00:00:00Z",
-                },
-            ).status_code
-            == 422
-        )
+@pytest.mark.parametrize(
+    "start",
+    [
+        "2026-11-20T00:00:00",
+        "2026-11-20T00:01:00Z",
+        "2026-11-01T00:00:00Z",
+    ],
+)
+def test_candles_api_validates_window(migrated_dir: Path, start: str):
+    [response] = api_get(
+        migrated_dir, ("/candles", {"start": start, "end": "2026-11-20T00:15:00Z"})
+    )
+    assert response.status_code == 422
 
 
 def test_health_reports_uninitialized_storage(tmp_path: Path):
-    with TestClient(create_app(tmp_path / "missing")) as api:
-        assert api.get("/health").status_code == 503
+    [response] = api_get(tmp_path / "missing", ("/health", None))
+    assert response.status_code == 503

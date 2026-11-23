@@ -1,15 +1,26 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import AwareDatetime
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import data_directory
 from app.market.models import BITCOIN, Candle, Market, Timeframe, candle_window
 from app.market.storage import CandleStore, StorageError
+from app.strategies.engine import generate_signals
+from app.strategies.models import Position, PullbackSettings, Signal
+from app.strategies.registry import DEFAULT_STRATEGY_VERSION
 
 MAX_QUERY_CANDLES = 2_000
+
+
+class SignalQuery(PullbackSettings):
+    start: AwareDatetime
+    end: AwareDatetime
+    position: Position = Position.FLAT
+    strategy_version: str = DEFAULT_STRATEGY_VERSION
 
 
 def create_app(data_dir: Path | None = None) -> FastAPI:
@@ -52,6 +63,22 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             raise HTTPException(422, f"Limit each query to {MAX_QUERY_CANDLES} candle slots.")
         try:
             return store.read(BITCOIN, timeframe, start, end)
+        except (SQLAlchemyError, StorageError) as exc:
+            raise HTTPException(503, "Candle storage unavailable.") from exc
+
+    @app.get("/signals")
+    def signals(query: Annotated[SignalQuery, Query()]) -> list[Signal]:
+        try:
+            return generate_signals(
+                store,
+                query.start,
+                query.end,
+                settings=query,
+                position=query.position,
+                strategy_version=query.strategy_version,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
         except (SQLAlchemyError, StorageError) as exc:
             raise HTTPException(503, "Candle storage unavailable.") from exc
 
