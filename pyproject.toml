@@ -1,0 +1,32 @@
+[project]
+name = "tradeos"
+version = "0.1.0"
+description = "Private Bitcoin market data and research foundation"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.14,<2",
+    "fastapi>=0.115,<1",
+    "httpx>=0.28,<1",
+    "pyarrow>=19,<25",
+    "pydantic>=2.10,<3",
+    "sqlalchemy>=2.0,<3",
+    "uvicorn>=0.34,<1",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.3,<10", "ruff>=0.11,<1"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+include = ["*.py", "*.pyi", "pyproject.toml"]
+extend-exclude = [".uv-cache", "data"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
