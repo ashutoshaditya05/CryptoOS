@@ -1,60 +1,52 @@
-from datetime import datetime
-from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
-from typing import Literal
+from decimal import Decimal
 
-from app.backtest.models import Side, SimulationSettings
-from app.market.models import Candle
-
-ZERO = Decimal(0)
-BASIS_POINTS = Decimal(10_000)
-
-
-def round_down(value: Decimal, increment: Decimal) -> Decimal:
-    return (value / increment).to_integral_value(rounding=ROUND_FLOOR) * increment
+from app.backtest.models import (
+    INR_PER_POINT_PER_LOT,
+    MAINTENANCE_RATE,
+    Bracket,
+    Fill,
+    ReplaySettings,
+)
+from app.market.orderbook import Level, Quote
 
 
-def round_up(value: Decimal, increment: Decimal) -> Decimal:
-    return (value / increment).to_integral_value(rounding=ROUND_CEILING) * increment
+def sweep(levels: tuple[Level, ...], contracts: int, cap_inr: Decimal | None = None) -> Fill | None:
+    remaining = contracts
+    notional = Decimal(0)
+    for price, available in levels:
+        unit_cost = price * INR_PER_POINT_PER_LOT
+        count = min(remaining, available)
+        if cap_inr is not None:
+            count = min(count, int((cap_inr - notional) // unit_cost))
+        if count <= 0:
+            break
+        notional += unit_cost * count
+        remaining -= count
+        if not remaining:
+            break
+    filled = contracts - remaining
+    if not filled or (cap_inr is None and remaining):
+        return None
+    return Fill(filled, notional / (filled * INR_PER_POINT_PER_LOT), notional)
 
 
-def execution_adjustment(settings: SimulationSettings) -> Decimal:
-    return (settings.spread_bps / 2 + settings.slippage_bps) / BASIS_POINTS
+def buy(quote: Quote, settings: ReplaySettings) -> Fill | None:
+    cap = settings.margin_inr * settings.leverage
+    contracts = int(cap // (quote.ask * INR_PER_POINT_PER_LOT))
+    return sweep(quote.asks, contracts, cap)
 
 
-def execution_price(reference: Decimal, side: Side, settings: SimulationSettings) -> Decimal:
-    adjustment = execution_adjustment(settings)
-    tick = settings.price_tick_inr
-    if side == "BUY":
-        return round_up(reference * (1 + adjustment), tick)
-    return round_down(reference * (1 - adjustment), tick)
+def bracket(fill: Fill, settings: ReplaySettings) -> Bracket | None:
+    entry = fill.average_usd
+    stop = entry - settings.stop_points
+    liquidation = entry * (1 - Decimal(1) / settings.leverage) / (1 - MAINTENANCE_RATE)
+    if stop <= max(0, liquidation):
+        return None
+    net_cost = entry * (1 + settings.fee_rate)
+    unit_risk = net_cost - stop * (1 - settings.fee_rate)
+    target = (net_cost + settings.reward_to_risk * unit_risk) / (1 - settings.fee_rate)
+    return Bracket(stop, target, liquidation, unit_risk * fill.contracts * INR_PER_POINT_PER_LOT)
 
 
-def net_sale_per_btc(reference: Decimal, settings: SimulationSettings) -> Decimal:
-    return execution_price(reference, "SELL", settings) * (1 - settings.sell_fee_bps / BASIS_POINTS)
-
-
-def target_for_net_sale(proceeds: Decimal, settings: SimulationSettings) -> Decimal:
-    tick = settings.price_tick_inr
-    fill = round_up(proceeds / (1 - settings.sell_fee_bps / BASIS_POINTS), tick)
-    return round_up(fill / (1 - execution_adjustment(settings)), tick)
-
-
-def available_quantity(previous: Candle | None, settings: SimulationSettings) -> Decimal:
-    if previous is None or previous.volume is None:
-        return ZERO
-    return round_down(previous.volume * settings.volume_participation, settings.quantity_step_btc)
-
-
-def protective_trigger(
-    candle: Candle, stop: Decimal | None, target: Decimal | None
-) -> tuple[str, Decimal, datetime, Literal["OPEN", "INTRABAR"]] | None:
-    if stop is not None and candle.open <= stop:
-        return "STOP_LOSS", candle.open, candle.open_time, "OPEN"
-    if target is not None and candle.open >= target:
-        return "TAKE_PROFIT", target, candle.open_time, "OPEN"
-    # With no intrabar ordering, a touch of both levels is resolved against the long.
-    if stop is not None and candle.low <= stop:
-        return "STOP_LOSS", stop, candle.close_time, "INTRABAR"
-    if target is not None and candle.high >= target:
-        return "TAKE_PROFIT", target, candle.close_time, "INTRABAR"
-    return None
+def net_pnl(entry: Fill, exit_: Fill, fee_rate: Decimal) -> Decimal:
+    return exit_.notional_inr * (1 - fee_rate) - entry.notional_inr * (1 + fee_rate)

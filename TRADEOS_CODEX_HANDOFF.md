@@ -1,6 +1,7 @@
 # TradeOS — Codex Project Handoff
 
-**Status:** Design/requirements established; implementation not yet verified or started in this conversation.  
+**Status:** Archived spot-research plan. See the [README](README.md) for the active BTCUSD order-book workflow.
+
 **Updated:** 2026-11-23  
 **Owner/use:** Single person, private use only. **Not** a SaaS, public product, or multi-user platform.
 

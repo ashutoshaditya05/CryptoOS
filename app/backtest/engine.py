@@ -1,285 +1,194 @@
-from collections.abc import Callable, Sequence
+from bisect import bisect_left
+from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime
-from decimal import Decimal, localcontext
-from typing import Literal
+from decimal import Decimal
 
-from app.backtest.fills import (
-    BASIS_POINTS,
-    ZERO,
-    available_quantity,
-    execution_price,
-    protective_trigger,
-    round_down,
-)
-from app.backtest.metrics import metrics_for
+from app.backtest.fills import bracket, buy, net_pnl, sweep
 from app.backtest.models import (
-    EquityPoint,
+    FUNDING_INTERVAL_US,
+    INR_PER_POINT_PER_LOT,
+    MAX_MARK_AGE_US,
+    SECOND_US,
+    Bracket,
     Fill,
-    Order,
-    Side,
-    SimulationResult,
-    SimulationSettings,
-    Trade,
+    ReplaySettings,
 )
-from app.market.indicators import INDICATOR_CONTEXT
-from app.market.models import Candle
-from app.strategies.engine import Replay
-from app.strategies.models import Position, Regime, Signal
-
-type SignalAt = Callable[[datetime, Position], Signal]
+from app.market.book_tape import Frame
+from app.strategies.orderbook_imbalance import Signal
 
 
-@dataclass(frozen=True)
-class Intent:
-    side: Side
-    decision_at: datetime
-    trigger: str
-    signal_id: str | None = None
-    stop: Decimal | None = None
-    target: Decimal | None = None
+@dataclass(frozen=True, slots=True)
+class Trade:
+    signal_us: int
+    entry_us: int
+    exit_us: int
+    entry: Fill
+    exit: Fill | None
+    bracket: Bracket
+    reason: str
+    pnl_inr: Decimal
 
 
-@dataclass
-class Holding:
-    opened_at: datetime
-    original_quantity: Decimal
-    quantity: Decimal
-    entry_cost: Decimal
-    remaining_cost: Decimal
-    equity_before: Decimal
-    stop: Decimal | None
-    target: Decimal | None
-    realized: Decimal = ZERO
+def frame_at(times: list[int], start: int, target: int, settings: ReplaySettings) -> int | None:
+    index = bisect_left(times, target, lo=start)
+    if index == len(times) or times[index] - target > settings.max_quote_age_us:
+        return None
+    return index
 
 
-class Portfolio:
-    def __init__(self, settings: SimulationSettings) -> None:
-        self.settings = settings
-        self.cash = settings.initial_cash_inr
-        self.realized = ZERO
-        self.holding: Holding | None = None
-        self.orders: list[Order] = []
-        self.trades: list[Trade] = []
+def entry_at(
+    frames: list[Frame], times: list[int], signal: Signal, settings: ReplaySettings
+) -> tuple[int, Fill] | str:
+    source = frames[signal.index]
+    index = frame_at(times, signal.index + 1, source.time_us + settings.latency_us, settings)
+    if index is None:
+        return "entry_unobserved"
+    current = frames[index]
+    quote = current.quote
+    if (
+        quote is None
+        or current.segment != source.segment
+        or not current.has_quote(settings.max_quote_age_us)
+    ):
+        return "entry_book_gap"
+    if quote.spread_bps > settings.max_spread_bps:
+        return "entry_wide_spread"
+    fill = buy(quote, settings)
+    return (index, fill) if fill is not None else "entry_insufficient_depth"
 
-    def record(
-        self,
-        intent: Intent,
-        status: Literal["FILLED", "PARTIALLY_FILLED", "CANCELLED", "REJECTED"],
-        *,
-        reason: str | None = None,
-        requested: Decimal | None = None,
-        fill: Fill | None = None,
-    ) -> None:
-        self.orders.append(
-            Order(
-                order_id=len(self.orders) + 1,
-                side=intent.side,
-                decision_at=intent.decision_at,
-                signal_id=intent.signal_id,
-                trigger=intent.trigger,
-                status=status,
-                reason=reason,
-                requested_btc=requested,
-                fill=fill,
-            )
-        )
 
-    def execute(
-        self,
-        intent: Intent,
-        reference: Decimal,
-        timestamp: datetime,
-        capacity: Decimal,
-        execution: Literal["OPEN", "INTRABAR"],
-    ) -> Decimal:
-        settings = self.settings
-        buy = intent.side == "BUY"
-        price = execution_price(reference, intent.side, settings)
-        if price <= 0:
-            self.record(intent, "REJECTED", reason="INVALID_EXECUTION_PRICE")
-            return ZERO
-        fee_rate = (settings.buy_fee_bps if buy else settings.sell_fee_bps) / BASIS_POINTS
-        max_order = round_down(settings.max_order_btc, settings.quantity_step_btc)
-
-        if buy:
-            if self.holding is not None:
-                self.record(intent, "REJECTED", reason="POSITION_ALREADY_LONG")
-                return ZERO
-            if (intent.stop is not None and price <= intent.stop) or (
-                intent.target is not None and price >= intent.target
-            ):
-                self.record(intent, "REJECTED", reason="ENTRY_OUTSIDE_BRACKET")
-                return ZERO
-            budget_quantity = self.cash * settings.allocation / (price * (1 + fee_rate))
-            requested = min(round_down(budget_quantity, settings.quantity_step_btc), max_order)
-        else:
-            if self.holding is None:
-                self.record(intent, "REJECTED", reason="POSITION_FLAT")
-                return ZERO
-            requested = min(self.holding.quantity, max_order)
-
-        if requested < settings.min_quantity_btc or requested * price < settings.min_notional_inr:
-            self.record(intent, "REJECTED", reason="BELOW_ORDER_MINIMUM", requested=requested)
-            return ZERO
-        quantity = min(requested, capacity)
-        if quantity < settings.min_quantity_btc or quantity * price < settings.min_notional_inr:
-            self.record(
-                intent, "CANCELLED", reason="INSUFFICIENT_PRIOR_VOLUME", requested=requested
-            )
-            return ZERO
-
-        notional = price * quantity
-        fee = notional * fee_rate
-        if buy:
-            cost = notional + fee
-            self.holding = Holding(
-                timestamp, quantity, quantity, cost, cost, self.cash, intent.stop, intent.target
-            )
-            self.cash -= cost
-        else:
-            self._sell(quantity, notional - fee, timestamp)
-        self.record(
-            intent,
-            "FILLED" if quantity == requested else "PARTIALLY_FILLED",
-            reason="VOLUME_CAP" if quantity < requested else None,
-            requested=requested,
-            fill=Fill(
-                timestamp=timestamp,
-                execution=execution,
-                quantity_btc=quantity,
-                reference_price_inr=reference,
-                price_inr=price,
-                notional_inr=notional,
-                fee_inr=fee,
-                spread_slippage_inr=abs(price - reference) * quantity,
-                cash_after_inr=self.cash,
-                position_after_btc=self.holding.quantity if self.holding is not None else ZERO,
-            ),
-        )
-        return quantity
-
-    def _sell(self, quantity: Decimal, proceeds: Decimal, timestamp: datetime) -> None:
-        holding = self.holding
-        assert holding is not None
-        basis = (
-            holding.remaining_cost
-            if quantity == holding.quantity
-            else holding.remaining_cost * quantity / holding.quantity
-        )
-        pnl = proceeds - basis
-        self.cash += proceeds
-        self.realized += pnl
-        holding.realized += pnl
-        holding.remaining_cost -= basis
-        holding.quantity -= quantity
-        if holding.quantity == 0:
-            self.trades.append(
-                Trade(
-                    opened_at=holding.opened_at,
-                    closed_at=timestamp,
-                    quantity_btc=holding.original_quantity,
-                    entry_cost_inr=holding.entry_cost,
-                    net_pnl_inr=holding.realized,
-                    return_on_entry=holding.realized / holding.entry_cost,
-                    return_on_equity=holding.realized / holding.equity_before,
-                )
-            )
-            self.holding = None
+def _fresh_mark(frame: Frame) -> bool:
+    return frame.mark is not None and frame.time_us - frame.mark_us <= MAX_MARK_AGE_US
 
 
 def simulate(
-    replay: Replay,
-    settings: SimulationSettings,
-    *,
-    signal_at: SignalAt | None,
-    start: datetime | None = None,
-    end: datetime | None = None,
-    candles: Sequence[Candle] | None = None,
-) -> SimulationResult:
-    initial_time = replay.start if start is None else start
-    final_time = replay.end if end is None else end
-    candles = replay.candles if candles is None else candles
-    with localcontext(INDICATOR_CONTEXT):
-        portfolio = Portfolio(settings)
-        peak = settings.initial_cash_inr
-        equity = [
-            EquityPoint(
-                timestamp=initial_time,
-                cash_inr=peak,
-                position_btc=ZERO,
-                mark_price_inr=None,
-                equity_inr=peak,
-                drawdown=ZERO,
-            )
-        ]
-        pending = None
-        unavailable = buys = sells = 0
+    frames: list[Frame], times: list[int], signals: list[Signal], settings: ReplaySettings
+) -> tuple[dict, list[Trade]]:
+    cash = peak = settings.initial_cash_inr
+    drawdown = Decimal(0)
+    trades: list[Trade] = []
+    skipped: Counter[str] = Counter()
+    censor = None
+    free_index = -1
+    max_hold_us = settings.max_hold_seconds * SECOND_US
+    fee = settings.fee_rate
 
-        for candle in candles:
-            capacity = available_quantity(replay.signal_bars.get(candle.open_time), settings)
-            if signal_at is None and portfolio.holding is None:
-                pending = Intent("BUY", candle.open_time, "BUY_AND_HOLD")
-            if pending is not None:
-                if pending.decision_at != candle.open_time:
-                    portfolio.record(pending, "CANCELLED", reason="MISSING_NEXT_CANDLE")
-                else:
-                    capacity -= portfolio.execute(
-                        pending, candle.open, candle.open_time, capacity, "OPEN"
-                    )
-                pending = None
+    for signal in signals:
+        if signal.index <= free_index:
+            skipped["position_already_open"] += 1
+            continue
+        entry = entry_at(frames, times, signal, settings)
+        if isinstance(entry, str):
+            skipped[entry] += 1
+            continue
+        entry_index, fill = entry
+        opened = frames[entry_index]
+        quote = opened.quote
+        assert quote is not None
+        plan = bracket(fill, settings)
+        if plan is None or quote.bid <= plan.stop_usd:
+            skipped["invalid_bracket"] += 1
+            continue
+        if not _fresh_mark(opened):
+            skipped["missing_entry_mark"] += 1
+            continue
+        funding_period = opened.time_us // FUNDING_INTERVAL_US
+        hold_until = opened.time_us + max_hold_us
+        if (hold_until + settings.latency_us) // FUNDING_INTERVAL_US != funding_period:
+            skipped["funding_boundary"] += 1
+            continue
+        margin = fill.notional_inr / settings.leverage
+        entry_fee = fill.notional_inr * fee
+        exit_reserve = plan.target_usd * fill.contracts * INR_PER_POINT_PER_LOT * fee
+        if cash < margin + entry_fee + exit_reserve:
+            skipped["insufficient_margin_and_fees"] += 1
+            continue
 
-            holding = portfolio.holding
-            if holding is not None:
-                trigger = protective_trigger(candle, holding.stop, holding.target)
-                if trigger is not None:
-                    reason, price, timestamp, execution = trigger
-                    portfolio.execute(
-                        Intent("SELL", timestamp, reason), price, timestamp, capacity, execution
-                    )
+        exit_reason = None
+        exit_due = 0
+        for index in range(entry_index, len(frames)):
+            frame = frames[index]
+            quote, mark = frame.quote, frame.mark
+            if frame.segment != opened.segment or not frame.has_quote(settings.max_quote_age_us):
+                censor = "book_gap"
+                break
+            if frame.time_us // FUNDING_INTERVAL_US != funding_period:
+                censor = "funding_boundary_during_exit"
+                break
+            if not _fresh_mark(frame):
+                censor = "stale_mark"
+                break
+            assert quote is not None and mark is not None
 
-            quantity = portfolio.holding.quantity if portfolio.holding is not None else ZERO
-            mark = portfolio.cash + quantity * candle.close
-            peak = max(peak, mark)
-            equity.append(
-                EquityPoint(
-                    timestamp=candle.close_time,
-                    cash_inr=portfolio.cash,
-                    position_btc=quantity,
-                    mark_price_inr=candle.close,
-                    equity_inr=mark,
-                    drawdown=(peak - mark) / peak,
+            exit_fill = None
+            if mark <= plan.liquidation_usd:
+                reason = "LIQUIDATION"
+                pnl = -margin - entry_fee
+            elif exit_reason is not None and frame.time_us >= exit_due:
+                if frame.time_us - exit_due > settings.max_quote_age_us:
+                    censor = "exit_quote_unobserved"
+                    break
+                exit_fill = sweep(quote.bids, fill.contracts)
+                if exit_fill is None:
+                    censor = "insufficient_exit_depth"
+                    break
+                reason = exit_reason
+                pnl = net_pnl(fill, exit_fill, fee)
+            else:
+                equity = cash + (mark - fill.average_usd) * fill.contracts * INR_PER_POINT_PER_LOT
+                equity -= entry_fee
+                peak = max(peak, equity)
+                drawdown = max(drawdown, (peak - equity) / peak)
+                if exit_reason is None:
+                    if quote.bid <= plan.stop_usd:
+                        exit_reason = "STOP_LOSS"
+                    elif quote.bid >= plan.target_usd:
+                        executable = sweep(quote.bids, fill.contracts)
+                        if executable is not None and executable.average_usd >= plan.target_usd:
+                            exit_reason = "TAKE_PROFIT"
+                    if exit_reason is None and frame.time_us >= hold_until:
+                        exit_reason = "TIME_EXIT"
+                    if exit_reason is not None:
+                        exit_due = frame.time_us + settings.latency_us
+                continue
+
+            cash += pnl
+            peak = max(peak, cash)
+            drawdown = max(drawdown, (peak - cash) / peak)
+            trades.append(
+                Trade(
+                    times[signal.index],
+                    opened.time_us,
+                    frame.time_us,
+                    fill,
+                    exit_fill,
+                    plan,
+                    reason,
+                    pnl,
                 )
             )
+            free_index = index
+            break
+        else:
+            censor = "capture_end"
+        if censor is not None:
+            censor = {"reason": censor, "entry_us": opened.time_us, "entry": fill, "bracket": plan}
+            break
 
-            if signal_at is not None:
-                position = Position.LONG if quantity > 0 else Position.FLAT
-                signal = signal_at(candle.close_time, position)
-                unavailable += signal.regime == Regime.DATA_UNAVAILABLE
-                buys += signal.action == "BUY"
-                sells += signal.action == "SELL"
-                if (signal.action == "BUY" and position == Position.FLAT) or (
-                    signal.action == "SELL" and position == Position.LONG
-                ):
-                    pending = Intent(
-                        signal.action,
-                        signal.timestamp,
-                        "STRATEGY_SIGNAL",
-                        signal.signal_id,
-                        signal.stop_loss,
-                        signal.take_profit,
-                    )
-
-        if pending is not None:
-            reason = "MISSING_NEXT_CANDLE" if pending.decision_at < final_time else "END_OF_WINDOW"
-            portfolio.record(pending, "CANCELLED", reason=reason)
-        return SimulationResult(
-            metrics=metrics_for(equity, portfolio.orders, portfolio.trades, portfolio.realized),
-            orders=portfolio.orders,
-            trades=portfolio.trades,
-            equity_curve=equity,
-            candles=len(candles),
-            unavailable_signals=unavailable,
-            buy_signals=buys,
-            sell_signals=sells,
-        )
+    realized = cash - settings.initial_cash_inr
+    wins = [trade.pnl_inr for trade in trades if trade.pnl_inr > 0]
+    losses = [-trade.pnl_inr for trade in trades if trade.pnl_inr < 0]
+    return {
+        "signals": len(signals),
+        "closed_trades": len(trades),
+        "realized_pnl_inr": realized,
+        "closed_trade_expectancy_inr": realized / len(trades) if trades else None,
+        "win_rate": Decimal(len(wins)) / len(trades) if trades else None,
+        "profit_factor": sum(wins) / sum(losses) if losses else None,
+        "mark_drawdown": drawdown,
+        "largest_closed_loss_inr": max(losses, default=None),
+        "exits": dict(Counter(trade.reason for trade in trades)),
+        "skipped": dict(skipped),
+        "censored_position": censor,
+        "unprocessed_signals": len(signals) - len(trades) - sum(skipped.values()) - bool(censor),
+    }, trades

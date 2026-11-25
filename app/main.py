@@ -1,28 +1,18 @@
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from pydantic import AwareDatetime
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.backtest.models import BacktestReport, BacktestRequest
-from app.backtest.service import get_backtest, run_backtest
 from app.config import data_directory
+from app.database import backtest_runs
 from app.market.models import BITCOIN, Candle, Market, Timeframe, candle_window
 from app.market.storage import CandleStore, StorageError
-from app.strategies.engine import generate_signals
-from app.strategies.models import Position, PullbackSettings, Signal
-from app.strategies.registry import DEFAULT_STRATEGY_VERSION
 
 MAX_QUERY_CANDLES = 2_000
-
-
-class SignalQuery(PullbackSettings):
-    start: AwareDatetime
-    end: AwareDatetime
-    position: Position = Position.FLAT
-    strategy_version: str = DEFAULT_STRATEGY_VERSION
 
 
 def create_app(data_dir: Path | None = None) -> FastAPI:
@@ -68,40 +58,18 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         except (SQLAlchemyError, StorageError) as exc:
             raise HTTPException(503, "Candle storage unavailable.") from exc
 
-    @app.get("/signals")
-    def signals(query: Annotated[SignalQuery, Query()]) -> list[Signal]:
-        try:
-            return generate_signals(
-                store,
-                query.start,
-                query.end,
-                settings=query,
-                position=query.position,
-                strategy_version=query.strategy_version,
-            )
-        except ValueError as exc:
-            raise HTTPException(422, str(exc)) from exc
-        except (SQLAlchemyError, StorageError) as exc:
-            raise HTTPException(503, "Candle storage unavailable.") from exc
-
-    @app.post("/backtests")
-    def create_backtest(request: BacktestRequest) -> BacktestReport:
-        try:
-            return run_backtest(store, request)
-        except ValueError as exc:
-            raise HTTPException(422, str(exc)) from exc
-        except (SQLAlchemyError, StorageError) as exc:
-            raise HTTPException(503, "Backtest storage unavailable.") from exc
-
     @app.get("/backtests/{run_id}")
-    def read_backtest(run_id: str) -> BacktestReport:
+    def read_backtest(run_id: str) -> dict:
         try:
-            report = get_backtest(store, run_id)
+            with store.engine.connect() as connection:
+                report = connection.scalar(
+                    select(backtest_runs.c.report_json).where(backtest_runs.c.id == run_id)
+                )
         except SQLAlchemyError as exc:
             raise HTTPException(503, "Backtest storage unavailable.") from exc
         if report is None:
             raise HTTPException(404, "Backtest not found.")
-        return report
+        return json.loads(report)
 
     return app
 
