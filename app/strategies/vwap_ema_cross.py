@@ -80,6 +80,25 @@ class VwapEmaCross:
         return Decision(action="HOLD", regime=regime, reason_codes=("NO_VWAP_EMA9_ENTRY",))
 
 
+class VwapEmaFixedRisk(VwapEmaCross):
+    version = "vwap_ema_fixed_risk@1.0.0"
+    settings_fingerprint = sha256(
+        f"{VwapEmaCross.settings_fingerprint}|stop=below_signal_low|exit=bracket".encode()
+    ).hexdigest()
+
+    def evaluate(
+        self, signal_bars: Sequence[Candle], context_bars: Sequence[Candle], position: Position
+    ) -> Decision:
+        if position == Position.LONG:
+            return Decision(
+                action="HOLD", regime=Regime.MIXED_TREND, reason_codes=("USE_STOP_AND_TARGET",)
+            )
+        decision = super().evaluate(signal_bars, context_bars, position)
+        if decision.action == "BUY":
+            return decision.model_copy(update={"stop_loss": signal_bars[-1].low})
+        return decision
+
+
 def session_vwap(candles: Sequence[Candle]) -> Decimal | None:
     with localcontext(INDICATOR_CONTEXT):
         total_volume = weighted_range_sum = Decimal(0)

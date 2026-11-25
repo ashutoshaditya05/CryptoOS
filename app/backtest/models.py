@@ -2,18 +2,25 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Annotated, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from app.market.ingestion import Gap
 from app.market.models import Timeframe
 from app.strategies.models import PullbackSettings
-from app.strategies.vwap_ema_cross import VwapEmaCross
+from app.strategies.vwap_ema_cross import VwapEmaCross, VwapEmaFixedRisk
 
 type Bps = Annotated[Decimal, Field(ge=0, le=2_000, max_digits=12, decimal_places=6)]
 type Fraction = Annotated[Decimal, Field(gt=0, le=1, max_digits=12, decimal_places=10)]
 type Quantity = Annotated[Decimal, Field(gt=0, le=1, max_digits=12, decimal_places=10)]
 type Money = Annotated[Decimal, Field(ge=0, max_digits=20, decimal_places=6)]
 type Side = Literal["BUY", "SELL"]
+
+
+class FixedRiskSettings(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    budget_inr: Annotated[Money, Field(gt=0)]
+    reward_to_risk: Annotated[Decimal, Field(gt=0, le=100, decimal_places=6)] = Decimal(2)
 
 
 class SimulationSettings(BaseModel):
@@ -31,6 +38,7 @@ class SimulationSettings(BaseModel):
     max_order_btc: Quantity = Decimal("0.25")
     min_notional_inr: Money = Decimal(0)
     price_tick_inr: Annotated[Money, Field(gt=0)] = Decimal("0.01")
+    fixed_risk: FixedRiskSettings | None = None
 
 
 class ResearchSettings(BaseModel):
@@ -53,6 +61,22 @@ class BacktestRequest(BaseModel):
     simulation: SimulationSettings = Field(default_factory=SimulationSettings)
     research: ResearchSettings | None = None
 
+    @model_validator(mode="after")
+    def validate_fixed_risk(self) -> "BacktestRequest":
+        needs_risk = self.strategy_version == VwapEmaFixedRisk.version
+        if needs_risk and self.simulation.fixed_risk is None:
+            raise ValueError("The fixed-risk VWAP/EMA strategy requires a rupee risk budget.")
+        if not needs_risk and self.simulation.fixed_risk is not None:
+            raise ValueError("A fixed risk budget requires the fixed-risk VWAP/EMA strategy.")
+        return self
+
+
+class RiskPlan(BaseModel):
+    stop_inr: Decimal
+    target_inr: Decimal
+    planned_loss_inr: Decimal
+    planned_profit_inr: Decimal
+
 
 class Fill(BaseModel):
     timestamp: datetime
@@ -65,6 +89,7 @@ class Fill(BaseModel):
     spread_slippage_inr: Decimal
     cash_after_inr: Decimal
     position_after_btc: Decimal
+    risk_plan: RiskPlan | None = None
 
 
 class Order(BaseModel):
