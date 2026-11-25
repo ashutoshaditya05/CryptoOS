@@ -35,20 +35,8 @@ class DeltaCandleProvider:
     ) -> list[Candle]:
         if market != BITCOIN:
             raise DeltaError("Only Delta India BTC_INR spot is configured.")
-        result = self._get(
-            "/v2/history/candles",
-            {
-                "symbol": market.symbol,
-                "resolution": timeframe.value,
-                "start": int(start.timestamp()),
-                "end": int(end.timestamp()) - 1,
-            },
-        )
-        if not isinstance(result, list):
-            raise DeltaError("Delta returned an invalid candle list.")
-
         candles = []
-        for row in result:
+        for row in self.history(market.symbol, timeframe, start, end):
             try:
                 if not isinstance(row, dict) or type(row.get("time")) is not int:
                     raise ValueError("Expected an integer Unix timestamp in seconds.")
@@ -73,6 +61,22 @@ class DeltaCandleProvider:
             except (KeyError, ValueError, OverflowError, OSError) as exc:
                 raise DeltaError(f"Delta returned an invalid candle: {exc}") from exc
         return candles
+
+    def history(
+        self, symbol: str, timeframe: Timeframe, start: datetime, end: datetime
+    ) -> list[dict[str, Any]]:
+        result = self._get(
+            "/v2/history/candles",
+            {
+                "symbol": symbol,
+                "resolution": timeframe.value,
+                "start": int(start.timestamp()),
+                "end": int(end.timestamp()) - 1,
+            },
+        )
+        if not isinstance(result, list) or any(not isinstance(row, dict) for row in result):
+            raise DeltaError("Delta returned an invalid candle list.")
+        return result
 
     def _get(self, path: str, params: dict[str, str | int] | None = None) -> Any:
         for attempt in range(3):
