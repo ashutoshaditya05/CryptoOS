@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from zlib import crc32
@@ -8,9 +9,10 @@ import pytest
 from app.backtest.engine import simulate
 from app.backtest.fills import net_pnl, sweep
 from app.backtest.models import ReplaySettings
-from app.market.book_tape import Frame, load_tape
+from app.backtest.research import research_sessions
+from app.market.book_tape import Frame, Tape, load_tape
 from app.market.orderbook import BookError, OrderBook, Quote
-from app.strategies.orderbook_imbalance import Signal, find_signals
+from app.strategies.orderbook_imbalance import Signal, find_signal_variants, find_signals
 
 
 def snapshot() -> dict:
@@ -82,6 +84,59 @@ def test_confirmed_entry_waits_for_taker_buying():
     base, confirmed = find_signals(frames, ReplaySettings(levels=2))
     assert [signal.index for signal in base] == [2]
     assert [signal.index for signal in confirmed] == [3]
+
+
+def test_flow_filter_requires_both_observed_activity_and_strong_buying():
+    frames = [
+        frame(0),
+        frame(1_000_000, signed=100),
+        frame(2_000_000, "60001", signed=10),
+        frame(2_100_000, "60090", signed=-160),
+        frame(2_200_000, "60090", signed=160),
+        frame(2_300_000, "60091", signed=40),
+    ]
+    settings = ReplaySettings(levels=2, flow_activity_seconds=2)
+    variants = find_signal_variants(frames, settings)
+    assert [signal.index for signal in variants["trade_confirmed"]] == [2]
+    [filtered] = variants["flow_filtered"]
+    assert filtered.index == 5
+    assert filtered.recent_mid_range_bps > filtered.estimated_round_trip_bps
+
+
+def test_flow_activity_window_starts_over_on_feed_reset():
+    frames = [
+        frame(0),
+        frame(1_000_000, "60100"),
+        replace(frame(1_500_000, "60000"), segment=2),
+        replace(frame(2_000_000, "60100", signed=100), segment=2),
+        replace(frame(2_500_000, "60100", signed=100), segment=2),
+    ]
+    settings = ReplaySettings(levels=2, flow_activity_seconds=2, persistence_ms=500)
+    variants = find_signal_variants(frames, settings)
+    assert [signal.index for signal in variants["trade_confirmed"]] == [3]
+    assert not variants["flow_filtered"]
+
+
+def test_multi_session_report_sorts_captures_and_resets_unresolved_positions(monkeypatch):
+    early, late = Path("early.jsonl"), Path("late.jsonl")
+    tapes = {
+        early: Tape([frame(i * 1_000_000, signed=100) for i in range(4)], {}, "early"),
+        late: Tape([frame(i * 1_000_000, signed=100) for i in range(20, 39)], {}, "late"),
+    }
+    monkeypatch.setattr("app.backtest.research.load_tape", tapes.__getitem__)
+    settings = ReplaySettings(levels=2, max_hold_seconds=2)
+    report = research_sessions([late, early], settings)
+    assert report["capture_seconds"] == 21
+    assert [session["capture_file"] for session in report["sessions"]] == [early.name, late.name]
+    summary = report["full_window"]["book_only"]
+    assert summary["portfolio"]["closed_trades"] == 1
+    assert summary["portfolio"]["unresolved_positions"] == {"capture_end": 1}
+    assert summary["markouts"]["horizons_seconds"][10]["observed"] == 1
+    windows = report["chronological_sessions"]
+    assert windows["earlier"]["full_window"]["book_only"]["portfolio"]["closed_trades"] == 0
+    assert windows["later"]["full_window"]["book_only"]["portfolio"]["closed_trades"] == 1
+    with pytest.raises(ValueError, match="Capture windows overlap"):
+        research_sessions([early, early], settings)
 
 
 def test_replay_delays_entry_and_stop_and_charges_both_fees():

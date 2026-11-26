@@ -2,13 +2,14 @@ from bisect import bisect_left
 from collections import Counter, defaultdict
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from statistics import mean, median
 
 from app.backtest.engine import entry_at, frame_at, simulate
 from app.backtest.fills import net_pnl, sweep
 from app.backtest.models import BASIS_POINTS, SECOND_US, ReplaySettings
-from app.market.book_tape import Frame, Tape
-from app.strategies.orderbook_imbalance import VERSION, Signal, find_signals
+from app.market.book_tape import Frame, Tape, load_tape
+from app.strategies.orderbook_imbalance import STRATEGIES, VERSION, Signal, find_signal_variants
 
 HORIZONS_SECONDS = (10, 60, 300)
 
@@ -34,6 +35,9 @@ def markouts(
             "signal_spread_bps": signal.spread_bps,
             "outcomes": {},
         }
+        if signal.recent_mid_range_bps is not None:
+            row["recent_mid_range_bps"] = signal.recent_mid_range_bps
+            row["estimated_round_trip_bps"] = signal.estimated_round_trip_bps
         rows.append(row)
         entry = entry_at(frames, times, signal, settings)
         if isinstance(entry, str):
@@ -126,35 +130,51 @@ def compare_episodes(book: list[dict], confirmed: list[dict]) -> dict:
 
 def evaluate(frames: list[Frame], settings: ReplaySettings, *, ledger: bool = False) -> dict:
     times = [frame.time_us for frame in frames]
-    book_only, confirmed = find_signals(frames, settings)
     result = {}
-    ledgers = []
-    for name, signals in (("book_only", book_only), ("trade_confirmed", confirmed)):
+    ledgers = {}
+    for name, signals in find_signal_variants(frames, settings).items():
         summary, trades = simulate(frames, times, signals, settings)
         forecasts, rows = markouts(frames, times, signals, settings)
-        ledgers.append(rows)
+        ledgers[name] = rows
         result[name] = {"portfolio": summary, "markouts": forecasts}
         if ledger:
             result[name] |= {"trades": trades, "signal_ledger": rows}
-    result["paired_episode_comparison"] = compare_episodes(*ledgers)
+    result["paired_episode_comparison"] = compare_episodes(
+        ledgers["book_only"], ledgers["trade_confirmed"]
+    )
     return result
 
 
-def research(tape: Tape, settings: ReplaySettings, *, ledger: bool = False) -> dict:
-    frames = tape.frames
-    start, end = frames[0].time_us, frames[-1].time_us
-    report = {
-        "strategy_version": VERSION,
-        "venue": "delta_india",
-        "symbol": "BTCUSD",
+def _capture_report(tape: Tape, settings: ReplaySettings, *, ledger: bool) -> dict:
+    start, end = tape.frames[0].time_us, tape.frames[-1].time_us
+    return {
         "capture_sha256": tape.sha256,
         "capture_start_utc": utc_string(start),
         "capture_end_utc": utc_string(end),
         "capture_seconds": Decimal(end - start) / SECOND_US,
         "data_quality": tape.quality,
-        "settings": settings.model_dump(mode="json"),
-        "full_window": evaluate(frames, settings, ledger=ledger),
+        "full_window": evaluate(tape.frames, settings, ledger=ledger),
+        "latency_sensitivity_ms": {
+            delay: evaluate(tape.frames, settings.model_copy(update={"latency_ms": delay}))
+            for delay in (100, 500)
+            if delay != settings.latency_ms
+        },
     }
+
+
+def _research_metadata(settings: ReplaySettings) -> dict:
+    return {
+        "strategy_version": VERSION,
+        "venue": "delta_india",
+        "symbol": "BTCUSD",
+        "settings": settings.model_dump(mode="json"),
+    }
+
+
+def research(tape: Tape, settings: ReplaySettings, *, ledger: bool = False) -> dict:
+    frames = tape.frames
+    start, end = frames[0].time_us, frames[-1].time_us
+    report = _research_metadata(settings) | _capture_report(tape, settings, ledger=ledger)
     split = start + (end - start) * 4 // 5
     index = bisect_left([frame.time_us for frame in frames], split)
     if 0 < index < len(frames):
@@ -163,9 +183,90 @@ def research(tape: Tape, settings: ReplaySettings, *, ledger: bool = False) -> d
             "earlier": evaluate(frames[:index], settings),
             "later": evaluate(frames[index:], settings),
         }
-    report["latency_sensitivity_ms"] = {
-        delay: evaluate(frames, settings.model_copy(update={"latency_ms": delay}))
-        for delay in (100, 500)
-        if delay != settings.latency_ms
-    }
     return report
+
+
+def _combine_windows(windows: list[dict]) -> dict:
+    combined = {}
+    for name in STRATEGIES:
+        portfolios = [window[name]["portfolio"] for window in windows]
+        closed = sum(row["closed_trades"] for row in portfolios)
+        pnl = sum((row["realized_pnl_inr"] for row in portfolios), Decimal(0))
+        unresolved = Counter(
+            row["censored_position"]["reason"] for row in portfolios if row["censored_position"]
+        )
+        horizons = {}
+        for horizon in HORIZONS_SECONDS:
+            samples = [window[name]["markouts"]["horizons_seconds"][horizon] for window in windows]
+            observed = sum(row["observed"] for row in samples)
+            missing: Counter[str] = Counter()
+            for row in samples:
+                missing.update(row["missing"])
+            weighted_net_bps = sum(
+                (row["mean_net_bps"] * row["observed"] for row in samples if row["observed"]),
+                Decimal(0),
+            )
+            horizons[horizon] = {
+                "observed": observed,
+                "missing": dict(missing),
+                "mean_net_bps": weighted_net_bps / observed if observed else None,
+                "positive_net": sum(row.get("positive_net", 0) for row in samples),
+            }
+        combined[name] = {
+            "portfolio": {
+                "signals": sum(row["signals"] for row in portfolios),
+                "closed_trades": closed,
+                "realized_pnl_inr": pnl,
+                "closed_trade_expectancy_inr": pnl / closed if closed else None,
+                "worst_session_mark_drawdown": max(row["mark_drawdown"] for row in portfolios),
+                "unresolved_positions": dict(unresolved),
+                "unprocessed_signals": sum(row["unprocessed_signals"] for row in portfolios),
+            },
+            "markouts": {"horizons_seconds": horizons},
+        }
+    return combined
+
+
+def _session_summary(sessions: list[dict]) -> dict:
+    return {
+        "session_count": len(sessions),
+        "capture_start_utc": sessions[0]["capture_start_utc"],
+        "capture_end_utc": sessions[-1]["capture_end_utc"],
+        "capture_seconds": sum(session["capture_seconds"] for session in sessions),
+        "full_window": _combine_windows([session["full_window"] for session in sessions]),
+    }
+
+
+def research_sessions(paths: list[Path], settings: ReplaySettings, *, ledger: bool = False) -> dict:
+    if len(paths) < 2:
+        raise ValueError("Multi-session research requires at least two capture files.")
+    sessions = [
+        {"capture_file": path.name} | _capture_report(load_tape(path), settings, ledger=ledger)
+        for path in paths
+    ]
+    sessions.sort(key=lambda session: session["capture_start_utc"])
+    for previous, current in zip(sessions, sessions[1:]):
+        if current["capture_start_utc"] <= previous["capture_end_utc"]:
+            raise ValueError(
+                f"Capture windows overlap: {previous['capture_file']} and "
+                f"{current['capture_file']}."
+            )
+    split = len(sessions) * 4 // 5
+    return (
+        _research_metadata(settings)
+        | _session_summary(sessions)
+        | {
+            "initial_cash_resets_per_session": True,
+            "sessions": sessions,
+            "chronological_sessions": {
+                "earlier": _session_summary(sessions[:split]),
+                "later": _session_summary(sessions[split:]),
+            },
+            "latency_sensitivity_ms": {
+                delay: _combine_windows(
+                    [session["latency_sensitivity_ms"][delay] for session in sessions]
+                )
+                for delay in sessions[0]["latency_sensitivity_ms"]
+            },
+        }
+    )

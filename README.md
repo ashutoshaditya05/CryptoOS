@@ -18,6 +18,7 @@ Each recording retains messages in local receive order. The collector and replay
 
 - Add the contract sizes at the five best bids and asks. Divide the bid-minus-ask difference by the combined size.
 - A long signal requires imbalance above **+0.30** for **two seconds** and a spread of at most **2 basis points**. The trade-confirmed rule also requires more taker-buy than taker-sell volume over those two seconds.
+- The `flow_filtered` candidate requires at least **50 net taker-buy contracts** and at least **65% taker-buy volume** over those two seconds. It also requires a **60-second mid-price range** at least as wide as the current spread plus round-trip fees. A fresh book must cover the lookback. Both original entry rules are available for comparison.
 - The replay waits **250 ms** and buys available asks up to the margin cap. It starts with **₹100,000 equity** and uses up to **₹50,000 isolated margin at 25×**.
 - The exit triggers at a **200-point stop**, at a target sized for **2:1 after modeled fees**, or after **five minutes**. The simulator applies the execution delay to exits and walks the visible bids. It checks liquidation against the sampled mark feed and leaves a position unresolved if a feed gap or the end of the file prevents an observed exit.
 
@@ -25,8 +26,16 @@ The simulation uses **5.9 bps in taker fees per side**, the exchange's fixed ₹
 
 ## Read the research report
 
-The report compares the book-only rule with the trade-confirmed rule. For each signal, it measures the mid-price move and the simulated net result from an executable exit after **10 seconds, 1 minute, and 5 minutes**. Markouts can overlap. The separate portfolio simulation holds one position at a time and reports closed P&L, drawdown, and unresolved positions.
+The report compares the book-only, trade-confirmed, and flow-filtered rules. For each signal, it measures the mid-price move and the simulated net result from an executable exit after **10 seconds, 1 minute, and 5 minutes**. Markouts can overlap. The separate portfolio simulation holds one position at a time and reports closed P&L, drawdown, and unresolved positions.
 
 The report pairs entries from the same imbalance episode to measure the effect of waiting for taker confirmation. It also compares chronological windows and checks **100 ms and 500 ms** execution delays. Forward observations that run past the file or cross a broken book sequence are counted separately. Use `--settings` with a JSON file to specify research assumptions. A profitability claim needs independent sessions across market conditions with rules fixed before evaluation.
+
+For longer tests, record separate sessions and repeat `--input` to replay them together.
+
+```powershell
+uv run python -m app.backtest --input data/btcusd-session-a.jsonl --input data/btcusd-session-b.jsonl --output data/btcusd-multi-session.json --ledger
+```
+
+The report sorts captures by timestamp and rejects overlaps. Each session starts flat with the configured initial equity and runs its own portfolio simulation. The combined report sums realized P&L, counts unresolved positions, and pools markouts by sample count. `chronological_sessions` assigns the first four-fifths of capture files, rounded down, to `earlier` and the rest to `later`.
 
 The existing spot candle API and archived report lookup remain available for viewing historical data.

@@ -25,6 +25,9 @@ class ReplaySettings(BaseModel):
     latency_ms: Annotated[int, Field(gt=0)] = 250
     max_quote_age_ms: Annotated[int, Field(gt=0)] = 2_000
     max_spread_bps: Annotated[Decimal, Field(gt=0)] = Decimal(2)
+    flow_min_net_contracts: Annotated[int, Field(gt=0)] = 50
+    flow_min_buy_share: Annotated[Decimal, Field(gt=Decimal("0.5"), le=1)] = Decimal("0.65")
+    flow_activity_seconds: Annotated[int, Field(gt=0)] = 60
     initial_cash_inr: Annotated[Decimal, Field(gt=0)] = Decimal(100_000)
     margin_inr: Annotated[Decimal, Field(gt=0)] = Decimal(50_000)
     leverage: Annotated[int, Field(ge=1, le=200)] = 25
